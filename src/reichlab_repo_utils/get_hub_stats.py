@@ -47,10 +47,13 @@ To use this script:
 #   "duckdb",
 #   "polars",
 #   "requests",
+#   "rich",
 # ]
 # ///
 
 import concurrent.futures
+import importlib.util
+import json
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -59,21 +62,18 @@ from urllib.parse import urlsplit
 import duckdb
 import polars as pl
 import requests
+from rich import print
+from rich.console import Console
+from rich.table import Table
 
 ###########################################################
-# List of Hubverse repos we're collecting stats for       #
-# (commented-out hubs have already been counted & saved)  #
+# Location of hubs.json file                              #
 ###########################################################
-HUB_REPO_LIST: list[str] = [
-    # "cdcepi/FluSight-forecast-hub",
-    # "reichlab/variant-nowcast-hub",
-    # "hubverse-org/flusight_hub_archive",
-    # "cdphmodeling/wnvca-2024",
-    # "european-modelling-hubs/flu-forecast-hub",
-    # "european-modelling-hubs/ari-forecast-hub",
-    # "european-modelling-hubs/RespiCompass",
-    "HopkinsIDD/rsv-forecast-hub",
-]
+try:
+    HUB_JSON_PATH = Path(importlib.util.find_spec("reichlab_repo_utils").origin).parent  # type: ignore
+except Exception:
+    HUB_JSON_PATH = Path(__file__).parent / "hubs.json"
+
 ###########################################################
 # A bunch of init stuff lazily stored in global variables #
 ###########################################################
@@ -92,14 +92,18 @@ FILE_COUNT = 0
 ###########################################################
 # Actual work starts here                                 #
 ###########################################################
-def main(owner: str, repo: str, data_dir: str) -> Path:
-    output_dir = Path(data_dir)
+def main(owner: str, repo: str, data_dir: str | None) -> Path:
+    if data_dir is None:
+        output_dir = Path.cwd() / "hub_stats"
+    else:
+        output_dir = Path(data_dir)
     output_dir.mkdir(exist_ok=True)
+    print(f"Getting stats for [italic green]{owner}/{repo}[/italic green]")
+
 
     repo_line_counts = pl.DataFrame()
     for directory in ["model-output", "target-data"]:
         files = list_files_in_directory(owner, repo, directory)
-        print(f"found {len(files)} files in {repo}/{directory}")
         if len(files) == 0:
             continue
 
@@ -133,7 +137,6 @@ def main(owner: str, repo: str, data_dir: str) -> Path:
 
     parquet_file = output_dir / f"{repo}.parquet"
     repo_line_counts.write_parquet(parquet_file)
-    print(f"Saved {parquet_file}")
     return parquet_file
 
 
@@ -194,7 +197,7 @@ def list_files_in_directory(owner, repo, directory) -> list[str]:
         response = session.get(url)
         # some hubs don't have a target-data directory, so 404 is a-ok
         if response.status_code == 404:
-            print(f"URL {url} not found")
+            print(f"[yellow]URL {url} not found[/yellow]")
             break
         response.raise_for_status()
         data = response.json()
@@ -225,7 +228,6 @@ def write_csv(output_dir: Path):
         hub_stats = pl.read_parquet(parquet_files)
         csv_file = output_dir / "hub_stats.csv"
         hub_stats.write_csv(csv_file)
-        print(f"Saved hub details: {csv_file}")
 
         # save a summarized version of hub stats
         hub_stats_summary = hub_stats.sql("""
@@ -238,8 +240,19 @@ def write_csv(output_dir: Path):
         hub_stats_summary.write_csv(summary_csv_file)
         print(f"Saved hub summaries: {summary_csv_file}")
 
-        # display summarized data on console for a quick gut check
-        print(hub_stats_summary)
+        # display summarized data on console
+        console = Console()
+        table = Table(title="Hub Stats Summary")
+
+        table.add_column("Repo", justify="left", style="cyan", no_wrap=True)
+        table.add_column("Dir", justify="left", style="magenta")
+        table.add_column("Row Count", justify="right", style="green")
+
+        for row in hub_stats_summary.iter_rows(named=True):
+            formatted_count = f"{row['row_count']:,}"
+            table.add_row(row["repo"], row["dir"], formatted_count)
+
+        console.print(table)
 
     except pl.exceptions.ComputeError:
         print(f"Cannot create .csv: no parquet files found in {output_dir}")
@@ -249,9 +262,11 @@ if __name__ == "__main__":
     data_dir = Path(__file__).parent / "data" / "hub_stats"
     if FILE_COUNT > 0:
         print(f"Limiting file count to {FILE_COUNT} for testing")
-    for repo_name in HUB_REPO_LIST:
-        print(f"Getting stats for {repo_name}...")
-        owner, repo = repo_name.strip().split("/")
+    with open(HUB_JSON_PATH, "r") as file:
+        hubs = json.load(file)
+    hub_list = hubs.get("hubs")
+    for hub in hub_list:
+        owner = hub["org"]
+        repo = hub["repo"]
         main(owner, repo, str(data_dir))
-    print("Updating .csv to include data for all hubs...")
     write_csv(data_dir)
